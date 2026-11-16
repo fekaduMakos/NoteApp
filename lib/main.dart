@@ -766,6 +766,7 @@ void deleteAttachmentFile(String path) {
 final FlutterLocalNotificationsPlugin _notifications =
 FlutterLocalNotificationsPlugin();
 
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -779,7 +780,26 @@ Future<void> main() async {
   const initSettings = InitializationSettings(
     android: AndroidInitializationSettings('@mipmap/ic_launcher'),
   );
-  await _notifications.initialize(settings: initSettings);
+  await _notifications.initialize(
+    settings: initSettings,
+    onDidReceiveNotificationResponse: (NotificationResponse response) {
+      final payload = response.payload;
+      if (payload != null && payload.startsWith('verify:')) {
+        EmailVerificationHelper.handleExternalVerificationPayload(payload);
+      }
+    },
+  );
+
+  final launchDetails = await _notifications.getNotificationAppLaunchDetails();
+  if (launchDetails?.didNotificationLaunchApp ?? false) {
+    final payload = launchDetails?.notificationResponse?.payload;
+    if (payload != null && payload.startsWith('verify:')) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        EmailVerificationHelper.handleExternalVerificationPayload(payload);
+      });
+    }
+  }
+
   final androidNotifications = _notifications
       .resolvePlatformSpecificImplementation<
       AndroidFlutterLocalNotificationsPlugin>();
@@ -823,6 +843,7 @@ class CloudNotesAppState extends State<CloudNotesApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: appNavigatorKey,
       debugShowCheckedModeBanner: false,
       title: 'NoteApp',
       themeMode: _themeMode,
@@ -949,11 +970,71 @@ class _SplashScreenState extends State<SplashScreen> {
 // ---------------------------------------------------------
 // ---------------------------------------------------------------------------
 // EMAIL VERIFICATION & CREDENTIAL RECOVERY (FORGOT PIN & FORGOT PASSWORD)
-// Interactive in-app verification link workflow: touch link to verify identity.
+// High-Security Multi Cross-Check Flow:
+// 1. Verification link is dispatched to the user's saved email / notification tray.
+// 2. The link is NOT displayed on the app screen to prevent local unauthorized access.
+// 3. Touching the link in the email / system notification brings the user directly
+//    to the "Add New PIN" interface.
 // ---------------------------------------------------------------------------
 
+class _PendingVerification {
+  final String email;
+  final String code;
+  final String token;
+  final String actionType;
+  final DateTime expiresAt;
+
+  _PendingVerification({
+    required this.email,
+    required this.code,
+    required this.token,
+    required this.actionType,
+    required this.expiresAt,
+  });
+}
+
 class EmailVerificationHelper {
-  /// Launches the interactive email verification link flow to reset the Security PIN.
+  static final Map<String, _PendingVerification> _pendingVerifications = {};
+  static VoidCallback? _dismissWaitingDialog;
+
+  /// Handles incoming deep link / notification touch: "verify:actionType:email:code:token"
+  static void handleExternalVerificationPayload(String payload) {
+    final parts = payload.split(':');
+    if (parts.length < 5) return;
+    final actionType = parts[1];
+    final email = parts[2];
+    final code = parts[3];
+    final token = parts[4];
+
+    final pending = _pendingVerifications[email];
+    if (pending == null || pending.code != code || pending.token != token) {
+      return;
+    }
+    if (DateTime.now().isAfter(pending.expiresAt)) {
+      _pendingVerifications.remove(email);
+      return;
+    }
+
+    _pendingVerifications.remove(email);
+
+    // If the in-app waiting screen is open, dismiss it
+    if (_dismissWaitingDialog != null) {
+      _dismissWaitingDialog!();
+      _dismissWaitingDialog = null;
+    }
+
+    // Direct the user to Add New PIN or Set New Password
+    final context = appNavigatorKey.currentContext;
+    if (context != null) {
+      if (actionType == 'reset_pin') {
+        _showSetNewPinDialog(context, email: email);
+      } else if (actionType == 'reset_password') {
+        _showSetNewPasswordDialog(context, email: email);
+      }
+    }
+  }
+
+  /// Launches the email verification link flow to reset the Security PIN.
   static Future<bool> showResetPinFlow(BuildContext context, {String initialEmail = ''}) async {
     final email = AuthService.instance.currentUser?.email ?? initialEmail.trim().toLowerCase();
     if (email.isEmpty) {
@@ -963,7 +1044,6 @@ class EmailVerificationHelper {
       return false;
     }
 
-    // Confirmation step
     final shouldSend = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -1006,7 +1086,7 @@ class EmailVerificationHelper {
             ),
             const SizedBox(height: 12),
             const Text(
-              'Touch the secure link in the email to verify your identity and set a new PIN without needing your old PIN.',
+              'For high security and cross-checking, the verification link is sent directly to your email (and system notification tray). Touch that link to open the "Add New PIN" interface.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
@@ -1025,26 +1105,37 @@ class EmailVerificationHelper {
 
     if (shouldSend != true || !context.mounted) return false;
 
-    // Show simulated email with touchable verification link
-    final verified = await _showSimulatedEmailModal(
+    final code = (100000 + Random.secure().nextInt(900000)).toString();
+    final token = SecurityService.instance.generateSalt(16);
+
+    await _dispatchExternalEmailVerification(
+      email: email,
+      actionType: 'reset_pin',
+      actionTitle: 'Reset Security PIN',
+      code: code,
+      token: token,
+    );
+
+    if (!context.mounted) return false;
+
+    final verified = await _showWaitingForEmailVerificationDialog(
       context: context,
       email: email,
       actionTitle: 'Reset Security PIN',
       actionType: 'reset_pin',
     );
 
-    if (verified != true || !context.mounted) return false;
-
-    // Prompt user to enter new PIN
-    return await _showSetNewPinDialog(context, email: email);
+    if (verified && context.mounted) {
+      return await _showSetNewPinDialog(context, email: email);
+    }
+    return false;
   }
 
-  /// Launches the interactive email verification link flow to reset the Account Password.
+  /// Launches the email verification link flow to reset the Account Password.
   static Future<bool> showResetPasswordFlow(BuildContext context, {String initialEmail = ''}) async {
     final emailController = TextEditingController(text: initialEmail.trim().toLowerCase());
     String? errorMsg;
 
-    // Step 1: Prompt email
     final targetEmail = await showDialog<String>(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -1112,194 +1203,236 @@ class EmailVerificationHelper {
 
     if (targetEmail == null || targetEmail.isEmpty || !context.mounted) return false;
 
-    // Show simulated email with touchable verification link
-    final verified = await _showSimulatedEmailModal(
+    final code = (100000 + Random.secure().nextInt(900000)).toString();
+    final token = SecurityService.instance.generateSalt(16);
+
+    await _dispatchExternalEmailVerification(
+      email: targetEmail,
+      actionType: 'reset_password',
+      actionTitle: 'Reset Account Password',
+      code: code,
+      token: token,
+    );
+
+    if (!context.mounted) return false;
+
+    final verified = await _showWaitingForEmailVerificationDialog(
       context: context,
       email: targetEmail,
       actionTitle: 'Reset Account Password',
       actionType: 'reset_password',
     );
 
-    if (verified != true || !context.mounted) return false;
-
-    // Prompt user to enter new password
-    return await _showSetNewPasswordDialog(context, email: targetEmail);
+    if (verified && context.mounted) {
+      return await _showSetNewPasswordDialog(context, email: targetEmail);
+    }
+    return false;
   }
 
-  /// Displays a realistic incoming email card with a touchable verification link.
-  static Future<bool> _showSimulatedEmailModal({
+  /// Dispatches the verification link externally to the saved email address and system notifications.
+  static Future<void> _dispatchExternalEmailVerification({
+    required String email,
+    required String actionType,
+    required String actionTitle,
+    required String code,
+    required String token,
+  }) async {
+    final link = 'noteapp://vault/verify?type=$actionType&email=$email&code=$code&token=$token';
+
+    _pendingVerifications[email] = _PendingVerification(
+      email: email,
+      code: code,
+      token: token,
+      actionType: actionType,
+      expiresAt: DateTime.now().add(const Duration(minutes: 15)),
+    );
+
+    final androidDetails = AndroidNotificationDetails(
+      'security_vault_email',
+      'Security & Email Verification',
+      channelDescription: 'Delivers multi-cross-check security verification links to saved email',
+      importance: Importance.max,
+      priority: Priority.high,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      styleInformation: BigTextStyleInformation(
+        'Touch this verification link to proceed:\n$link\n\nSecurity verification code: $code',
+      ),
+    );
+
+    await _notifications.show(
+      id: 99991,
+      title: '📧 Vault Security: $actionTitle Link',
+      body: 'To: $email • Touch link to verify & $actionTitle (Code: $code)',
+      notificationDetails: NotificationDetails(android: androidDetails),
+      payload: 'verify:$actionType:$email:$code:$token',
+    );
+  }
+
+  /// Displays the secure waiting screen where the verification link is NOT shown on the app screen.
+  static Future<bool> _showWaitingForEmailVerificationDialog({
     required BuildContext context,
     required String email,
     required String actionTitle,
     required String actionType,
   }) async {
-    final token = SecurityService.instance.generateSalt(16);
-    final link = 'https://noteapp.vault/verify?type=$actionType&token=$token';
-    bool isVerifying = false;
+    final codeController = TextEditingController();
+    String? errorMsg;
+    bool isClosedByExternalTouch = false;
 
     final result = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlgState) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-          contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
-          title: Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(color: Colors.indigo.shade50, shape: BoxShape.circle),
-                child: const Icon(Icons.mark_email_unread, color: Colors.indigo, size: 22),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text('Simulated Mail Inbox', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(color: Colors.green.shade50, borderRadius: BorderRadius.circular(12)),
-                child: Text('Offline Ready', style: TextStyle(color: Colors.green.shade800, fontSize: 10, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          ),
-          content: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 420),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const SizedBox(height: 6),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade50,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          const Text('From: ', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.grey)),
-                          const Expanded(
-                            child: Text('security@noteapp.vault (Vault Security)', style: TextStyle(fontSize: 12, color: Colors.black87)),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          const Text('To: ', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.grey)),
-                          Expanded(
-                            child: Text(email, style: const TextStyle(fontSize: 12, color: Colors.black87)),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          const Text('Subject: ', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.grey)),
-                          Expanded(
-                            child: Text('🔐 $actionTitle Verification', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.indigo)),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 14),
-                const Text(
-                  'Hello! A verification request was initiated for your vault. Please touch the secure link below to verify your identity:',
-                  style: TextStyle(fontSize: 13, color: Colors.black87),
-                ),
-                const SizedBox(height: 14),
+      builder: (ctx) {
+        _dismissWaitingDialog = () {
+          isClosedByExternalTouch = true;
+          if (ctx.mounted) Navigator.pop(ctx, true);
+        };
 
-                // THE TOUCHABLE VERIFICATION LINK
-                Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    onTap: isVerifying
-                        ? null
-                        : () async {
-                            setDlgState(() => isVerifying = true);
-                            await Future.delayed(const Duration(milliseconds: 600));
-                            if (ctx.mounted) {
-                              Navigator.pop(ctx, true);
-                            }
-                          },
-                    borderRadius: BorderRadius.circular(12),
-                    child: Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: Colors.indigo.shade50,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.indigo.shade300, width: 1.5),
-                      ),
-                      child: isVerifying
-                          ? const Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.indigo)),
-                                SizedBox(width: 12),
-                                Text('Verifying cryptographic token...', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo, fontSize: 13)),
-                              ],
-                            )
-                          : Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    const Icon(Icons.touch_app, color: Colors.indigo, size: 20),
-                                    const SizedBox(width: 8),
-                                    const Text('Touch link to verify identity:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.indigo)),
-                                    const Spacer(),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                      decoration: BoxDecoration(color: Colors.indigo, borderRadius: BorderRadius.circular(6)),
-                                      child: const Text('VERIFY', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  link,
-                                  style: const TextStyle(
-                                    color: Colors.indigo,
-                                    decoration: TextDecoration.underline,
-                                    fontSize: 12,
-                                    fontFamily: 'monospace',
-                                  ),
-                                ),
-                              ],
-                            ),
-                    ),
-                  ),
+        return StatefulBuilder(
+          builder: (ctx, setDlgState) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(color: Colors.indigo.shade50, shape: BoxShape.circle),
+                  child: const Icon(Icons.mark_email_read_outlined, color: Colors.indigo, size: 22),
                 ),
-                const SizedBox(height: 10),
-                const Text(
-                  '💡 Note: In this offline vault, the link simulation confirms identity instantly without external mail servers.',
-                  style: TextStyle(fontSize: 11, color: Colors.grey, fontStyle: FontStyle.italic),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text('Verification Sent', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 ),
               ],
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: isVerifying ? null : () => Navigator.pop(ctx, false),
-              child: const Text('Cancel'),
+            content: SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 400),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'For security verification and multi cross-checking, the verification link has been sent to your registered email:',
+                      style: TextStyle(fontSize: 13, color: Colors.grey),
+                    ),
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: Colors.indigo.shade50,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.indigo.shade200),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.email, size: 18, color: Colors.indigo),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              email,
+                              style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo, fontSize: 13),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.amber.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.amber.shade300),
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(Icons.shield, size: 18, color: Colors.amber.shade900),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'The verification link is NOT displayed on this screen for security cross-check. Check your email or pull down your system notification tray and touch the link to proceed.',
+                              style: TextStyle(fontSize: 12, color: Colors.amber.shade900),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Or enter the 6-digit code received in the email / notification:',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    if (errorMsg != null)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(6)),
+                        child: Text(errorMsg!, style: TextStyle(color: Colors.red.shade900, fontSize: 11)),
+                      ),
+                    TextField(
+                      controller: codeController,
+                      keyboardType: TextInputType.number,
+                      maxLength: 6,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 20, letterSpacing: 4, fontWeight: FontWeight.bold),
+                      decoration: InputDecoration(
+                        hintText: '• • • • • •',
+                        counterText: '',
+                        prefixIcon: const Icon(Icons.pin),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-          ],
-        ),
-      ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  _dismissWaitingDialog = null;
+                  Navigator.pop(ctx, false);
+                },
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  final entered = codeController.text.trim();
+                  final pending = _pendingVerifications[email];
+                  if (pending == null || pending.code != entered) {
+                    setDlgState(() => errorMsg = 'Invalid verification code. Please check your email.');
+                    return;
+                  }
+                  if (DateTime.now().isAfter(pending.expiresAt)) {
+                    _pendingVerifications.remove(email);
+                    setDlgState(() => errorMsg = 'Verification code has expired. Please request a new link.');
+                    return;
+                  }
+                  _pendingVerifications.remove(email);
+                  _dismissWaitingDialog = null;
+                  Navigator.pop(ctx, true);
+                },
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
+                child: const Text('Verify Code'),
+              ),
+            ],
+          ),
+        );
+      },
     );
+
+    _dismissWaitingDialog = null;
+
+    if (isClosedByExternalTouch) {
+      return false; // Already handled by handleExternalVerificationPayload
+    }
 
     return result ?? false;
   }
 
-  /// Dialog allowing the verified user to set a new PIN.
+  /// Dialog allowing the verified user to add/set a new PIN.
   static Future<bool> _showSetNewPinDialog(BuildContext context, {required String email}) async {
     final pinController = TextEditingController();
     final confirmController = TextEditingController();
@@ -1315,7 +1448,7 @@ class EmailVerificationHelper {
             children: [
               Icon(Icons.check_circle, color: Colors.green),
               SizedBox(width: 8),
-              Text('Set New PIN', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              Text('Add New PIN', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ],
           ),
           content: Column(
@@ -1329,7 +1462,7 @@ class EmailVerificationHelper {
                     const Icon(Icons.verified, size: 16, color: Colors.green),
                     const SizedBox(width: 6),
                     Expanded(
-                      child: Text('Email verified for $email', style: TextStyle(color: Colors.green.shade900, fontSize: 12, fontWeight: FontWeight.bold)),
+                      child: Text('Identity verified for $email', style: TextStyle(color: Colors.green.shade900, fontSize: 12, fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
@@ -1396,7 +1529,7 @@ class EmailVerificationHelper {
     if (success == true && context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('✅ Security PIN reset successfully! Use your new PIN to unlock notes.'),
+          content: Text('✅ Security PIN updated successfully! You can now use your new PIN.'),
           backgroundColor: Colors.green,
         ),
       );
@@ -1512,7 +1645,6 @@ class EmailVerificationHelper {
     return false;
   }
 }
-
 // ---------------------------------------------------------
 // AUTHENTICATION SCREEN: SECURE SIGN IN & REGISTRATION
 // ---------------------------------------------------------
