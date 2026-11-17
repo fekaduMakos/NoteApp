@@ -770,45 +770,62 @@ final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  tz.initializeTimeZones();
+
+  // Launch UI immediately so the app renders the splash screen without delay
+  runApp(const CloudNotesApp());
+
+  // Initialize all background services asynchronously without blocking the main UI thread
+  _initializeBackgroundServices();
+}
+
+Future<void> _initializeBackgroundServices() async {
   try {
+    await AuthService.instance.initialize();
+    await LocalNotesStore.instance.initialize();
+  } catch (_) {}
+
+  try {
+    tz.initializeTimeZones();
     final zone = await FlutterTimezone.getLocalTimezone();
     tz.setLocalLocation(tz.getLocation(zone.identifier));
-  } catch (_) {
-    // Use the default timezone if the device timezone cannot be read.
-  }
-  const initSettings = InitializationSettings(
-    android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-  );
-  await _notifications.initialize(
-    settings: initSettings,
-    onDidReceiveNotificationResponse: (NotificationResponse response) {
-      final payload = response.payload;
+  } catch (_) {}
+
+  try {
+    const initSettings = InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    );
+    await _notifications.initialize(
+      settings: initSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) {
+        final payload = response.payload;
+        if (payload != null && payload.startsWith('verify:')) {
+          EmailVerificationHelper.handleExternalVerificationPayload(payload);
+        }
+      },
+    );
+
+    final launchDetails = await _notifications.getNotificationAppLaunchDetails();
+    if (launchDetails?.didNotificationLaunchApp ?? false) {
+      final payload = launchDetails?.notificationResponse?.payload;
       if (payload != null && payload.startsWith('verify:')) {
-        EmailVerificationHelper.handleExternalVerificationPayload(payload);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          EmailVerificationHelper.handleExternalVerificationPayload(payload);
+        });
       }
-    },
-  );
-
-  final launchDetails = await _notifications.getNotificationAppLaunchDetails();
-  if (launchDetails?.didNotificationLaunchApp ?? false) {
-    final payload = launchDetails?.notificationResponse?.payload;
-    if (payload != null && payload.startsWith('verify:')) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        EmailVerificationHelper.handleExternalVerificationPayload(payload);
-      });
     }
-  }
+  } catch (_) {}
 
-  final androidNotifications = _notifications
-      .resolvePlatformSpecificImplementation<
-      AndroidFlutterLocalNotificationsPlugin>();
-  await androidNotifications?.requestNotificationsPermission();
-  await androidNotifications?.requestExactAlarmsPermission();
-  await AuthService.instance.initialize();
-  await LocalNotesStore.instance.initialize();
-  ConnectivityService.instance.initialize();
-  runApp(const CloudNotesApp());
+  try {
+    ConnectivityService.instance.initialize();
+  } catch (_) {}
+
+  // Request notifications permission safely in the background
+  try {
+    final androidNotifications = _notifications
+        .resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await androidNotifications?.requestNotificationsPermission();
+  } catch (_) {}
 }
 
 class CloudNotesApp extends StatefulWidget {
@@ -890,17 +907,25 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) {
-        final targetScreen = AuthService.instance.isAuthenticated
-            ? const NotesScreen()
-            : const AuthScreen();
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (context) => targetScreen),
-        );
-      }
-    });
+    _startApp();
+  }
+
+  Future<void> _startApp() async {
+    try {
+      await AuthService.instance.initialize();
+      await LocalNotesStore.instance.initialize();
+    } catch (_) {}
+
+    await Future.delayed(const Duration(milliseconds: 1500));
+    if (mounted) {
+      final targetScreen = AuthService.instance.isAuthenticated
+          ? const NotesScreen()
+          : const AuthScreen();
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => targetScreen),
+      );
+    }
   }
 
   @override
