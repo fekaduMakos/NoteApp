@@ -5737,13 +5737,22 @@ class _UserProfileScreenState extends State<UserProfileScreen> with SingleTicker
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
-                                const Row(
-                                  children: [
-                                    Icon(Icons.shield_outlined, color: Colors.indigo, size: 22),
-                                    SizedBox(width: 8),
-                                    Text('Security PIN Lock', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                                  ],
+                                const Expanded(
+                                  child: Row(
+                                    children: [
+                                      Icon(Icons.shield_outlined, color: Colors.indigo, size: 22),
+                                      SizedBox(width: 8),
+                                      Flexible(
+                                        child: Text(
+                                          'Security PIN Lock',
+                                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
+                                const SizedBox(width: 8),
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                                   decoration: BoxDecoration(
@@ -5828,13 +5837,22 @@ class _UserProfileScreenState extends State<UserProfileScreen> with SingleTicker
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
-                                const Row(
-                                  children: [
-                                    Icon(Icons.mark_email_read_outlined, color: Colors.indigo, size: 22),
-                                    SizedBox(width: 8),
-                                    Text('Email Delivery & SMTP', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                                  ],
+                                const Expanded(
+                                  child: Row(
+                                    children: [
+                                      Icon(Icons.mark_email_read_outlined, color: Colors.indigo, size: 22),
+                                      SizedBox(width: 8),
+                                      Flexible(
+                                        child: Text(
+                                          'Email Delivery & SMTP',
+                                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
+                                const SizedBox(width: 8),
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                                   decoration: BoxDecoration(

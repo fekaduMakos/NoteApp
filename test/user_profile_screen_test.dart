@@ -47,6 +47,7 @@ void main() {
     expect(find.text('Confirm New Password *'), findsOneWidget);
     expect(find.text('Update Password'), findsOneWidget);
     expect(find.text('Security PIN Lock'), findsOneWidget);
+    expect(find.text('Email Delivery & SMTP'), findsOneWidget);
     expect(find.text('Log Out of Account'), findsOneWidget);
   });
 }

@@ -145,5 +145,35 @@ void main() {
         throwsA(isA<Exception>()),
       );
     });
+
+    test('EmailSenderService correctly stores, activates, and clears SMTP settings', () async {
+      final emailService = EmailSenderService.instance;
+      await emailService.initialize();
+
+      // Initially not configured
+      await emailService.clearSmtpSettings();
+      expect(emailService.isConfigured, isFalse);
+      expect(emailService.smtpHost, isNull);
+
+      // Save custom SMTP configuration
+      await emailService.saveSmtpSettings(
+        host: 'smtp.gmail.com',
+        port: 465,
+        username: 'user@gmail.com',
+        password: 'app-password-1234',
+        senderEmail: 'support@cloudnotes.io',
+      );
+
+      expect(emailService.isConfigured, isTrue);
+      expect(emailService.smtpHost, equals('smtp.gmail.com'));
+      expect(emailService.smtpPort, equals(465));
+      expect(emailService.smtpUser, equals('user@gmail.com'));
+      expect(emailService.smtpSender, equals('support@cloudnotes.io'));
+
+      // Clear configuration returns to unconfigured device instant mode
+      await emailService.clearSmtpSettings();
+      expect(emailService.isConfigured, isFalse);
+      expect(emailService.smtpHost, isNull);
+    });
   });
 }
