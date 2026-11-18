@@ -13,6 +13,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
+import 'package:intl/intl.dart';
 
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,9 @@ class AppUser {
   final String id;
   final String email;
   final String name;
+  final String? phone;
+  final String? bio;
+  final int? avatarColor;
   final String passwordSalt;
   final String passwordHash;
   final String? pinSalt;
@@ -108,6 +112,9 @@ class AppUser {
     required this.id,
     required this.email,
     required this.name,
+    this.phone,
+    this.bio,
+    this.avatarColor,
     required this.passwordSalt,
     required this.passwordHash,
     this.pinSalt,
@@ -121,6 +128,9 @@ class AppUser {
     'id': id,
     'email': email,
     'name': name,
+    'phone': phone,
+    'bio': bio,
+    'avatarColor': avatarColor,
     'passwordSalt': passwordSalt,
     'passwordHash': passwordHash,
     'pinSalt': pinSalt,
@@ -131,7 +141,10 @@ class AppUser {
   factory AppUser.fromJson(Map<String, dynamic> json) => AppUser(
     id: json['id'] as String,
     email: json['email'] as String,
-    name: json['name'] as String,
+    name: json['name'] as String? ?? 'Notes User',
+    phone: json['phone'] as String?,
+    bio: json['bio'] as String?,
+    avatarColor: json['avatarColor'] as int?,
     passwordSalt: json['passwordSalt'] as String,
     passwordHash: json['passwordHash'] as String,
     pinSalt: json['pinSalt'] as String?,
@@ -140,15 +153,22 @@ class AppUser {
   );
 
   AppUser copyWith({
+    String? email,
     String? name,
+    String? phone,
+    String? bio,
+    int? avatarColor,
     String? passwordSalt,
     String? passwordHash,
     String? pinSalt,
     String? pinHash,
   }) => AppUser(
     id: id,
-    email: email,
+    email: email ?? this.email,
     name: name ?? this.name,
+    phone: phone ?? this.phone,
+    bio: bio ?? this.bio,
+    avatarColor: avatarColor ?? this.avatarColor,
     passwordSalt: passwordSalt ?? this.passwordSalt,
     passwordHash: passwordHash ?? this.passwordHash,
     pinSalt: pinSalt ?? this.pinSalt,
@@ -174,18 +194,24 @@ class AuthService {
   Stream<AppUser?> get onAuthStateChanged => _authController.stream;
 
   Future<void> initialize() async {
-    _prefs ??= await SharedPreferences.getInstance();
+    _prefs = await SharedPreferences.getInstance();
     final usersRaw = _prefs!.getString(_usersKey);
     if (usersRaw != null && usersRaw.isNotEmpty) {
       try {
         final decoded = jsonDecode(usersRaw) as List;
         _users = decoded.map((m) => AppUser.fromJson(Map<String, dynamic>.from(m as Map))).toList();
-      } catch (_) {}
+      } catch (_) {
+        _users = [];
+      }
+    } else {
+      _users = [];
     }
 
     final activeId = _prefs!.getString(_sessionKey);
     if (activeId != null) {
       _currentUser = _users.where((u) => u.id == activeId).firstOrNull;
+    } else {
+      _currentUser = null;
     }
   }
 
@@ -369,6 +395,99 @@ class AuthService {
       _authController.add(_currentUser);
     }
     await _saveUsers();
+  }
+
+  /// Updates profile information: name, email, phone, bio, and avatarColor.
+  Future<AppUser> updateProfile({
+    required String name,
+    required String email,
+    String? phone,
+    String? bio,
+    int? avatarColor,
+  }) async {
+    await initialize();
+    if (_currentUser == null) {
+      throw Exception('You must be logged in to update your profile.');
+    }
+
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) {
+      throw Exception('Full Name cannot be empty.');
+    }
+
+    final cleanEmail = email.trim().toLowerCase();
+    if (cleanEmail.isEmpty || !cleanEmail.contains('@') || !cleanEmail.contains('.')) {
+      throw Exception('Please enter a valid email address.');
+    }
+
+    // Verify email uniqueness if email is changed
+    if (cleanEmail != _currentUser!.email.toLowerCase()) {
+      final conflict = _users.any((u) => u.id != _currentUser!.id && u.email.toLowerCase() == cleanEmail);
+      if (conflict) {
+        throw Exception('An account with this email address already exists.');
+      }
+    }
+
+    final updated = _currentUser!.copyWith(
+      name: trimmedName,
+      email: cleanEmail,
+      phone: (phone == null || phone.trim().isEmpty) ? null : phone.trim(),
+      bio: (bio == null || bio.trim().isEmpty) ? null : bio.trim(),
+      avatarColor: avatarColor ?? _currentUser!.avatarColor,
+    );
+
+    final idx = _users.indexWhere((u) => u.id == _currentUser!.id);
+    if (idx != -1) {
+      _users[idx] = updated;
+    }
+    _currentUser = updated;
+    await _saveUsers();
+    _authController.add(_currentUser);
+    return updated;
+  }
+
+  /// Securely changes the user's password using salted SHA-256 iterations.
+  Future<void> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    await initialize();
+    if (_currentUser == null) {
+      throw Exception('You must be logged in to change your password.');
+    }
+
+    final valid = SecurityService.instance.verifyPassword(
+      currentPassword,
+      _currentUser!.passwordSalt,
+      _currentUser!.passwordHash,
+    );
+    if (!valid) {
+      throw Exception('Current password is incorrect. Please check and try again.');
+    }
+
+    if (newPassword.length < 6) {
+      throw Exception('New password must be at least 6 characters long.');
+    }
+
+    if (currentPassword == newPassword) {
+      throw Exception('New password must be different from current password.');
+    }
+
+    final newSalt = SecurityService.instance.generateSalt();
+    final newHash = SecurityService.instance.hashPassword(newPassword, newSalt);
+
+    final updated = _currentUser!.copyWith(
+      passwordSalt: newSalt,
+      passwordHash: newHash,
+    );
+
+    final idx = _users.indexWhere((u) => u.id == _currentUser!.id);
+    if (idx != -1) {
+      _users[idx] = updated;
+    }
+    _currentUser = updated;
+    await _saveUsers();
+    _authController.add(_currentUser);
   }
 }
 
@@ -2027,6 +2146,153 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   }
 }
 
+Future<bool> promptSetPinDialog(BuildContext context) async {
+  final userHasPin = AuthService.instance.currentUser?.hasPin ?? false;
+  final oldPinController = TextEditingController();
+  final pinController = TextEditingController();
+  final confirmController = TextEditingController();
+  String? errorMsg;
+
+  final success = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDlgState) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            const Icon(Icons.shield_outlined, color: Colors.indigo),
+            const SizedBox(width: 8),
+            Text(
+              userHasPin ? 'Change Security PIN' : 'Set Security PIN',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                userHasPin
+                    ? 'To change your PIN, enter your current (old) PIN first, followed by your new PIN.'
+                    : 'Set a 4-to-6 digit PIN to protect sensitive notes. Your PIN is cryptographically salted and hashed.',
+                style: const TextStyle(fontSize: 13, color: Colors.grey),
+              ),
+              const SizedBox(height: 16),
+              if (errorMsg != null)
+                Container(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(errorMsg!, style: TextStyle(color: Colors.red.shade900, fontSize: 12)),
+                ),
+
+              // If user already has a PIN, require the Current (Old) PIN!
+              if (userHasPin) ...[
+                TextField(
+                  controller: oldPinController,
+                  obscureText: true,
+                  keyboardType: TextInputType.number,
+                  maxLength: 6,
+                  decoration: const InputDecoration(
+                    labelText: 'Current (Old) PIN',
+                    prefixIcon: Icon(Icons.lock_clock),
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    icon: const Icon(Icons.mail_lock_outlined, size: 15, color: Colors.indigo),
+                    label: const Text('Forgot current PIN? Reset via email', style: TextStyle(fontSize: 12)),
+                    onPressed: () async {
+                      Navigator.pop(ctx, false);
+                      await EmailVerificationHelper.showResetPinFlow(context);
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+
+              TextField(
+                controller: pinController,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                maxLength: 6,
+                decoration: InputDecoration(
+                  labelText: userHasPin ? 'New PIN (4-6 digits)' : 'PIN (4-6 digits)',
+                  prefixIcon: const Icon(Icons.pin),
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: confirmController,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                maxLength: 6,
+                decoration: const InputDecoration(
+                  labelText: 'Confirm PIN',
+                  prefixIcon: Icon(Icons.check),
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              final oldPin = oldPinController.text.trim();
+              final pin = pinController.text.trim();
+              final confirm = confirmController.text.trim();
+
+              if (userHasPin) {
+                if (oldPin.isEmpty) {
+                  setDlgState(() => errorMsg = 'Please enter your current (old) PIN.');
+                  return;
+                }
+                if (!AuthService.instance.verifySecurityPin(oldPin)) {
+                  setDlgState(() => errorMsg = 'Current PIN is incorrect. Try again or reset via email.');
+                  return;
+                }
+                if (oldPin == pin) {
+                  setDlgState(() => errorMsg = 'New PIN must be different from current PIN.');
+                  return;
+                }
+              }
+
+              if (pin.length < 4) {
+                setDlgState(() => errorMsg = 'PIN must be at least 4 digits.');
+                return;
+              }
+              if (pin != confirm) {
+                setDlgState(() => errorMsg = 'PINs do not match.');
+                return;
+              }
+
+              await AuthService.instance.setSecurityPin(pin);
+              if (ctx.mounted) Navigator.pop(ctx, true);
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
+            child: Text(userHasPin ? 'Update PIN' : 'Save PIN'),
+          ),
+        ],
+      ),
+    ),
+  );
+  return success ?? false;
+}
+
 class NotesScreen extends StatefulWidget {
   const NotesScreen({super.key});
 
@@ -2055,11 +2321,15 @@ class _NotesScreenState extends State<NotesScreen> {
   bool _isSyncing = false;
   StreamSubscription<bool>? _connectivitySub;
   StreamSubscription<SyncResult>? _syncSub;
+  StreamSubscription<AppUser?>? _authSub;
   final Set<String> _unlockedDocIds = {};
 
   @override
   void initState() {
     super.initState();
+    _authSub = AuthService.instance.onAuthStateChanged.listen((user) {
+      if (mounted) setState(() {});
+    });
     _isOnline = ConnectivityService.instance.isOnline;
     _connectivitySub = ConnectivityService.instance.onConnectivityChanged.listen((online) {
       if (mounted) {
@@ -2111,6 +2381,7 @@ class _NotesScreenState extends State<NotesScreen> {
 
   @override
   void dispose() {
+    _authSub?.cancel();
     _connectivitySub?.cancel();
     _syncSub?.cancel();
     _titleController.dispose();
@@ -2120,152 +2391,7 @@ class _NotesScreenState extends State<NotesScreen> {
     super.dispose();
   }
 
-    Future<bool> _promptSetPinDialog() async {
-    final userHasPin = AuthService.instance.currentUser?.hasPin ?? false;
-    final oldPinController = TextEditingController();
-    final pinController = TextEditingController();
-    final confirmController = TextEditingController();
-    String? errorMsg;
-
-    final success = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlgState) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: Row(
-            children: [
-              const Icon(Icons.shield_outlined, color: Colors.indigo),
-              const SizedBox(width: 8),
-              Text(
-                userHasPin ? 'Change Security PIN' : 'Set Security PIN',
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-            ],
-          ),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  userHasPin
-                      ? 'To change your PIN, enter your current (old) PIN first, followed by your new PIN.'
-                      : 'Set a 4-to-6 digit PIN to protect sensitive notes. Your PIN is cryptographically salted and hashed.',
-                  style: const TextStyle(fontSize: 13, color: Colors.grey),
-                ),
-                const SizedBox(height: 16),
-                if (errorMsg != null)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 12),
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.red.shade50,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(errorMsg!, style: TextStyle(color: Colors.red.shade900, fontSize: 12)),
-                  ),
-
-                // If user already has a PIN, require the Current (Old) PIN!
-                if (userHasPin) ...[
-                  TextField(
-                    controller: oldPinController,
-                    obscureText: true,
-                    keyboardType: TextInputType.number,
-                    maxLength: 6,
-                    decoration: const InputDecoration(
-                      labelText: 'Current (Old) PIN',
-                      prefixIcon: Icon(Icons.lock_clock),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton.icon(
-                      icon: const Icon(Icons.mail_lock_outlined, size: 15, color: Colors.indigo),
-                      label: const Text('Forgot current PIN? Reset via email', style: TextStyle(fontSize: 12)),
-                      onPressed: () async {
-                        Navigator.pop(ctx, false);
-                        await EmailVerificationHelper.showResetPinFlow(context);
-                      },
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                ],
-
-                TextField(
-                  controller: pinController,
-                  obscureText: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  decoration: InputDecoration(
-                    labelText: userHasPin ? 'New PIN (4-6 digits)' : 'PIN (4-6 digits)',
-                    prefixIcon: const Icon(Icons.pin),
-                    border: const OutlineInputBorder(),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: confirmController,
-                  obscureText: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  decoration: const InputDecoration(
-                    labelText: 'Confirm PIN',
-                    prefixIcon: Icon(Icons.check),
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () async {
-                final oldPin = oldPinController.text.trim();
-                final pin = pinController.text.trim();
-                final confirm = confirmController.text.trim();
-
-                if (userHasPin) {
-                  if (oldPin.isEmpty) {
-                    setDlgState(() => errorMsg = 'Please enter your current (old) PIN.');
-                    return;
-                  }
-                  if (!AuthService.instance.verifySecurityPin(oldPin)) {
-                    setDlgState(() => errorMsg = 'Current PIN is incorrect. Try again or reset via email.');
-                    return;
-                  }
-                  if (oldPin == pin) {
-                    setDlgState(() => errorMsg = 'New PIN must be different from current PIN.');
-                    return;
-                  }
-                }
-
-                if (pin.length < 4) {
-                  setDlgState(() => errorMsg = 'PIN must be at least 4 digits.');
-                  return;
-                }
-                if (pin != confirm) {
-                  setDlgState(() => errorMsg = 'PINs do not match.');
-                  return;
-                }
-
-                await AuthService.instance.setSecurityPin(pin);
-                if (ctx.mounted) Navigator.pop(ctx, true);
-              },
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
-              child: Text(userHasPin ? 'Update PIN' : 'Save PIN'),
-            ),
-          ],
-        ),
-      ),
-    );
-    return success ?? false;
-  }
+  Future<bool> _promptSetPinDialog() => promptSetPinDialog(context);
 
   Future<void> _promptUnlockNote(String docId, Map<String, dynamic> noteData) async {
     final pinController = TextEditingController();
@@ -3417,64 +3543,107 @@ class _NotesScreenState extends State<NotesScreen> {
           padding: EdgeInsets.zero,
           children: [
             DrawerHeader(
-              decoration: const BoxDecoration(color: Colors.indigo),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  Row(
-                    children: [
-                      CircleAvatar(
-                        radius: 22,
-                        backgroundColor: Colors.white,
-                        child: Text(
-                          (AuthService.instance.currentUser?.name.isNotEmpty == true)
-                              ? AuthService.instance.currentUser!.name[0].toUpperCase()
-                              : 'U',
-                          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.indigo),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              AuthService.instance.currentUser?.name ?? 'Notes User',
-                              style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            Text(
-                              AuthService.instance.currentUser?.email ?? '',
-                              style: const TextStyle(color: Colors.white70, fontSize: 12),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: const Row(
-                          children: [
-                            Icon(Icons.lock, size: 11, color: Colors.white),
-                            SizedBox(width: 4),
-                            Text('Private Vault Active', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
+              decoration: BoxDecoration(
+                color: (AuthService.instance.currentUser?.avatarColor != null)
+                    ? Color(AuthService.instance.currentUser!.avatarColor!)
+                    : Colors.indigo,
               ),
+              child: InkWell(
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (context) => const UserProfileScreen()),
+                  );
+                },
+                borderRadius: BorderRadius.circular(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 24,
+                          backgroundColor: Colors.white,
+                          child: Text(
+                            (AuthService.instance.currentUser?.name.isNotEmpty == true)
+                                ? AuthService.instance.currentUser!.name[0].toUpperCase()
+                                : 'U',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                              color: (AuthService.instance.currentUser?.avatarColor != null)
+                                  ? Color(AuthService.instance.currentUser!.avatarColor!)
+                                  : Colors.indigo,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                AuthService.instance.currentUser?.name ?? 'Notes User',
+                                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              Text(
+                                AuthService.instance.currentUser?.email ?? '',
+                                style: const TextStyle(color: Colors.white70, fontSize: 12),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ],
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.all(6),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.25),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.edit, size: 15, color: Colors.white),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: const Row(
+                            children: [
+                              Icon(Icons.lock, size: 11, color: Colors.white),
+                              SizedBox(width: 4),
+                              Text('Private Vault Active', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+                            ],
+                          ),
+                        ),
+                        const Spacer(),
+                        const Text('Edit Profile â†’', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.person_outline, color: Colors.indigo),
+              title: const Text('Edit Profile & Account', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('Change name, email, password & info', style: TextStyle(fontSize: 12)),
+              trailing: const Icon(Icons.arrow_forward_ios, size: 14, color: Colors.grey),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const UserProfileScreen()),
+                );
+              },
             ),
             ListTile(
               leading: const Icon(Icons.shield_outlined, color: Colors.indigo),
@@ -4198,5 +4367,918 @@ class _NotesScreenState extends State<NotesScreen> {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// USER PROFILE & ACCOUNT MANAGEMENT SCREEN
+// Allows customer to update personal info (name, email, phone, bio, avatar),
+// change password, configure security PIN, and view vault stats.
+// ---------------------------------------------------------------------------
+
+class UserProfileScreen extends StatefulWidget {
+  const UserProfileScreen({super.key});
+
+  @override
+  State<UserProfileScreen> createState() => _UserProfileScreenState();
+}
+
+class _UserProfileScreenState extends State<UserProfileScreen> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  final _profileFormKey = GlobalKey<FormState>();
+  final _passwordFormKey = GlobalKey<FormState>();
+
+  // Profile controllers
+  late TextEditingController _nameController;
+  late TextEditingController _emailController;
+  late TextEditingController _phoneController;
+  late TextEditingController _bioController;
+
+  // Password controllers
+  final TextEditingController _currentPasswordController = TextEditingController();
+  final TextEditingController _newPasswordController = TextEditingController();
+  final TextEditingController _confirmPasswordController = TextEditingController();
+
+  bool _obscureCurrent = true;
+  bool _obscureNew = true;
+  bool _obscureConfirm = true;
+
+  bool _isSavingProfile = false;
+  bool _isSavingPassword = false;
+  String? _profileError;
+  String? _passwordError;
+  int? _selectedColor;
+  int _noteCount = 0;
+  StreamSubscription<AppUser?>? _authSub;
+
+  static const List<Map<String, dynamic>> _colorPalette = [
+    {'name': 'Indigo', 'value': 0xFF3F51B5},
+    {'name': 'Deep Purple', 'value': 0xFF673AB7},
+    {'name': 'Blue', 'value': 0xFF1976D2},
+    {'name': 'Teal', 'value': 0xFF00897B},
+    {'name': 'Green', 'value': 0xFF2E7D32},
+    {'name': 'Amber', 'value': 0xFFF57F17},
+    {'name': 'Deep Orange', 'value': 0xFFE64A19},
+    {'name': 'Pink', 'value': 0xFFD81B60},
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    final user = AuthService.instance.currentUser;
+    _nameController = TextEditingController(text: user?.name ?? '');
+    _emailController = TextEditingController(text: user?.email ?? '');
+    _phoneController = TextEditingController(text: user?.phone ?? '');
+    _bioController = TextEditingController(text: user?.bio ?? '');
+    _selectedColor = user?.avatarColor ?? 0xFF3F51B5;
+
+    _authSub = AuthService.instance.onAuthStateChanged.listen((u) {
+      if (mounted) setState(() {});
+    });
+
+    _loadVaultStats();
+  }
+
+  Future<void> _loadVaultStats() async {
+    final docs = await LocalNotesStore.instance.readAll();
+    if (mounted) {
+      setState(() {
+        _noteCount = docs.length;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    _tabController.dispose();
+    _nameController.dispose();
+    _emailController.dispose();
+    _phoneController.dispose();
+    _bioController.dispose();
+    _currentPasswordController.dispose();
+    _newPasswordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _saveProfile() async {
+    if (!_profileFormKey.currentState!.validate()) return;
+
+    setState(() {
+      _isSavingProfile = true;
+      _profileError = null;
+    });
+
+    try {
+      await AuthService.instance.updateProfile(
+        name: _nameController.text.trim(),
+        email: _emailController.text.trim(),
+        phone: _phoneController.text.trim(),
+        bio: _bioController.text.trim(),
+        avatarColor: _selectedColor,
+      );
+
+      if (mounted) {
+        setState(() => _isSavingProfile = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Icon(Icons.check_circle_outline, color: Colors.white, size: 20),
+                SizedBox(width: 10),
+                Text('Personal info saved successfully!'),
+              ],
+            ),
+            backgroundColor: Colors.teal,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isSavingProfile = false;
+          _profileError = e.toString().replaceAll('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  Future<void> _savePassword() async {
+    if (!_passwordFormKey.currentState!.validate()) return;
+
+    final currentPass = _currentPasswordController.text;
+    final newPass = _newPasswordController.text;
+    final confirmPass = _confirmPasswordController.text;
+
+    if (newPass != confirmPass) {
+      setState(() => _passwordError = 'New passwords do not match.');
+      return;
+    }
+
+    setState(() {
+      _isSavingPassword = true;
+      _passwordError = null;
+    });
+
+    try {
+      await AuthService.instance.changePassword(
+        currentPassword: currentPass,
+        newPassword: newPass,
+      );
+
+      if (mounted) {
+        setState(() {
+          _isSavingPassword = false;
+          _currentPasswordController.clear();
+          _newPasswordController.clear();
+          _confirmPasswordController.clear();
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Icon(Icons.lock_reset, color: Colors.white, size: 20),
+                SizedBox(width: 10),
+                Text('Password changed successfully!'),
+              ],
+            ),
+            backgroundColor: Colors.teal,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isSavingPassword = false;
+          _passwordError = e.toString().replaceAll('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  void _handleLogout() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Log Out'),
+        content: const Text('Are you sure you want to log out of your account? Your notes will remain safely stored on this device.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            child: const Text('Log Out'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      await AuthService.instance.logout();
+      if (mounted) {
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(builder: (context) => const AuthScreen()),
+          (route) => false,
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final cardBg = isDark ? Colors.grey.shade900 : Colors.white;
+    final currentUser = AuthService.instance.currentUser;
+    final themeColor = _selectedColor != null ? Color(_selectedColor!) : Colors.indigo;
+
+    String memberSince = 'Recently';
+    if (currentUser?.createdAt != null) {
+      try {
+        final parsedDate = DateTime.parse(currentUser!.createdAt);
+        memberSince = DateFormat.yMMMd().format(parsedDate);
+      } catch (_) {}
+    }
+
+    return Scaffold(
+      backgroundColor: isDark ? Colors.black : Colors.grey.shade100,
+      appBar: AppBar(
+        title: const Text('Edit Profile & Account', style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: themeColor,
+        foregroundColor: Colors.white,
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: Colors.white,
+          indicatorWeight: 3,
+          labelColor: Colors.white,
+          unselectedLabelColor: Colors.white70,
+          tabs: const [
+            Tab(icon: Icon(Icons.person_outline), text: 'Personal Info'),
+            Tab(icon: Icon(Icons.security_outlined), text: 'Security & Login'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          // -------------------------------------------------------------
+          // TAB 1: PERSONAL INFO
+          // -------------------------------------------------------------
+          SingleChildScrollView(
+            padding: const EdgeInsets.all(20.0),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 600),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Profile Header Hero Card
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(20),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [themeColor, themeColor.withValues(alpha: 0.75)],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: [
+                          BoxShadow(
+                            color: themeColor.withValues(alpha: 0.3),
+                            blurRadius: 12,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        children: [
+                          CircleAvatar(
+                            radius: 40,
+                            backgroundColor: Colors.white,
+                            child: Text(
+                              (currentUser?.name.isNotEmpty == true)
+                                  ? currentUser!.name[0].toUpperCase()
+                                  : 'U',
+                              style: TextStyle(
+                                fontSize: 36,
+                                fontWeight: FontWeight.bold,
+                                color: themeColor,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            currentUser?.name ?? 'Notes User',
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            currentUser?.email ?? '',
+                            style: const TextStyle(fontSize: 14, color: Colors.white70),
+                          ),
+                          if (currentUser?.bio != null && currentUser!.bio!.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              currentUser.bio!,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                color: Colors.white,
+                                fontStyle: FontStyle.italic,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                          const SizedBox(height: 12),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.verified_user_outlined, size: 14, color: Colors.white),
+                                SizedBox(width: 6),
+                                Text(
+                                  'Private Vault Account',
+                                  style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Avatar & Theme Color Picker
+                    Card(
+                      elevation: 0,
+                      color: cardBg,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        side: BorderSide(color: isDark ? Colors.grey.shade800 : Colors.grey.shade300),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Row(
+                              children: [
+                                Icon(Icons.palette_outlined, color: Colors.indigo, size: 20),
+                                SizedBox(width: 8),
+                                Text('Profile Accent Color', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Choose your personalized theme color for the profile badge and avatar.',
+                              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                            ),
+                            const SizedBox(height: 14),
+                            Wrap(
+                              spacing: 12,
+                              runSpacing: 10,
+                              children: _colorPalette.map((palette) {
+                                final colorVal = palette['value'] as int;
+                                final isSelected = _selectedColor == colorVal;
+                                return GestureDetector(
+                                  onTap: () {
+                                    setState(() => _selectedColor = colorVal);
+                                  },
+                                  child: Container(
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      color: Color(colorVal),
+                                      shape: BoxShape.circle,
+                                      border: Border.all(
+                                        color: isSelected ? Colors.white : Colors.transparent,
+                                        width: 2.5,
+                                      ),
+                                      boxShadow: [
+                                        if (isSelected)
+                                          BoxShadow(
+                                            color: Color(colorVal).withValues(alpha: 0.6),
+                                            blurRadius: 8,
+                                            spreadRadius: 1,
+                                          ),
+                                      ],
+                                    ),
+                                    child: isSelected
+                                        ? const Icon(Icons.check, size: 18, color: Colors.white)
+                                        : null,
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Personal Information Form
+                    Card(
+                      elevation: 0,
+                      color: cardBg,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        side: BorderSide(color: isDark ? Colors.grey.shade800 : Colors.grey.shade300),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(20.0),
+                        child: Form(
+                          key: _profileFormKey,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.edit_note_rounded, color: Colors.indigo, size: 22),
+                                  SizedBox(width: 8),
+                                  Text('Personal Details', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                                ],
+                              ),
+                              const SizedBox(height: 16),
+
+                              // Full Name
+                              TextFormField(
+                                controller: _nameController,
+                                decoration: InputDecoration(
+                                  labelText: 'Full Name *',
+                                  prefixIcon: const Icon(Icons.person_outline),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                validator: (val) {
+                                  if (val == null || val.trim().isEmpty) {
+                                    return 'Please enter your full name.';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              const SizedBox(height: 16),
+
+                              // Email Address
+                              TextFormField(
+                                controller: _emailController,
+                                keyboardType: TextInputType.emailAddress,
+                                decoration: InputDecoration(
+                                  labelText: 'Email Address *',
+                                  prefixIcon: const Icon(Icons.email_outlined),
+                                  helperText: 'Used for login and verification link resets',
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                validator: (val) {
+                                  if (val == null || val.trim().isEmpty) {
+                                    return 'Please enter your email address.';
+                                  }
+                                  final clean = val.trim().toLowerCase();
+                                  if (!clean.contains('@') || !clean.contains('.')) {
+                                    return 'Please enter a valid email address.';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              const SizedBox(height: 16),
+
+                              // Phone Number
+                              TextFormField(
+                                controller: _phoneController,
+                                keyboardType: TextInputType.phone,
+                                decoration: InputDecoration(
+                                  labelText: 'Phone Number (Optional)',
+                                  hintText: '+1 234 567 8900',
+                                  prefixIcon: const Icon(Icons.phone_outlined),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+
+                              // Bio / Tagline
+                              TextFormField(
+                                controller: _bioController,
+                                maxLines: 2,
+                                decoration: InputDecoration(
+                                  labelText: 'About Me / Tagline (Optional)',
+                                  hintText: 'Software developer, student, or personal notes',
+                                  prefixIcon: const Icon(Icons.badge_outlined),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+
+                              if (_profileError != null)
+                                Container(
+                                  margin: const EdgeInsets.only(bottom: 14),
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: Colors.red.shade50,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: Colors.red.shade200),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.error_outline, color: Colors.red, size: 18),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          _profileError!,
+                                          style: TextStyle(color: Colors.red.shade900, fontSize: 13),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+
+                              SizedBox(
+                                width: double.infinity,
+                                height: 48,
+                                child: ElevatedButton.icon(
+                                  onPressed: _isSavingProfile ? null : _saveProfile,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: themeColor,
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  icon: _isSavingProfile
+                                      ? const SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                        )
+                                      : const Icon(Icons.save_outlined),
+                                  label: Text(
+                                    _isSavingProfile ? 'Saving...' : 'Save Profile Changes',
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // -------------------------------------------------------------
+          // TAB 2: SECURITY & LOGIN
+          // -------------------------------------------------------------
+          SingleChildScrollView(
+            padding: const EdgeInsets.all(20.0),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 600),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Change Password Card
+                    Card(
+                      elevation: 0,
+                      color: cardBg,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        side: BorderSide(color: isDark ? Colors.grey.shade800 : Colors.grey.shade300),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(20.0),
+                        child: Form(
+                          key: _passwordFormKey,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Row(
+                                children: [
+                                  Icon(Icons.lock_reset, color: Colors.indigo, size: 22),
+                                  SizedBox(width: 8),
+                                  Text('Change Account Password', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                'Your password is cryptographically protected with 5,000 SHA-256 iterations and random salt.',
+                                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                              ),
+                              const SizedBox(height: 16),
+
+                              // Current Password
+                              TextFormField(
+                                controller: _currentPasswordController,
+                                obscureText: _obscureCurrent,
+                                decoration: InputDecoration(
+                                  labelText: 'Current Password *',
+                                  prefixIcon: const Icon(Icons.lock_outline),
+                                  suffixIcon: IconButton(
+                                    icon: Icon(_obscureCurrent ? Icons.visibility_off : Icons.visibility),
+                                    onPressed: () => setState(() => _obscureCurrent = !_obscureCurrent),
+                                  ),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                validator: (val) {
+                                  if (val == null || val.isEmpty) {
+                                    return 'Please enter your current password.';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              const SizedBox(height: 14),
+
+                              // New Password
+                              TextFormField(
+                                controller: _newPasswordController,
+                                obscureText: _obscureNew,
+                                decoration: InputDecoration(
+                                  labelText: 'New Password *',
+                                  prefixIcon: const Icon(Icons.key_outlined),
+                                  helperText: 'Minimum 6 characters',
+                                  suffixIcon: IconButton(
+                                    icon: Icon(_obscureNew ? Icons.visibility_off : Icons.visibility),
+                                    onPressed: () => setState(() => _obscureNew = !_obscureNew),
+                                  ),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                validator: (val) {
+                                  if (val == null || val.length < 6) {
+                                    return 'Password must be at least 6 characters.';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              const SizedBox(height: 14),
+
+                              // Confirm New Password
+                              TextFormField(
+                                controller: _confirmPasswordController,
+                                obscureText: _obscureConfirm,
+                                decoration: InputDecoration(
+                                  labelText: 'Confirm New Password *',
+                                  prefixIcon: const Icon(Icons.check_circle_outline),
+                                  suffixIcon: IconButton(
+                                    icon: Icon(_obscureConfirm ? Icons.visibility_off : Icons.visibility),
+                                    onPressed: () => setState(() => _obscureConfirm = !_obscureConfirm),
+                                  ),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                ),
+                                validator: (val) {
+                                  if (val == null || val.isEmpty) {
+                                    return 'Please confirm your new password.';
+                                  }
+                                  if (val != _newPasswordController.text) {
+                                    return 'Passwords do not match.';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              const SizedBox(height: 12),
+
+                              if (_passwordError != null)
+                                Container(
+                                  margin: const EdgeInsets.only(bottom: 14),
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: Colors.red.shade50,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: Colors.red.shade200),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.error_outline, color: Colors.red, size: 18),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          _passwordError!,
+                                          style: TextStyle(color: Colors.red.shade900, fontSize: 13),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+
+                              SizedBox(
+                                width: double.infinity,
+                                height: 48,
+                                child: ElevatedButton.icon(
+                                  onPressed: _isSavingPassword ? null : _savePassword,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.indigo,
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  icon: _isSavingPassword
+                                      ? const SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                        )
+                                      : const Icon(Icons.lock_reset),
+                                  label: Text(
+                                    _isSavingPassword ? 'Updating Password...' : 'Update Password',
+                                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Align(
+                                alignment: Alignment.center,
+                                child: TextButton.icon(
+                                  icon: const Icon(Icons.mail_lock_outlined, size: 16),
+                                  label: const Text('Forgot current password? Reset via email link'),
+                                  onPressed: () {
+                                    EmailVerificationHelper.showResetPasswordFlow(
+                                      context,
+                                      initialEmail: currentUser?.email ?? '',
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Security PIN Card
+                    Card(
+                      elevation: 0,
+                      color: cardBg,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        side: BorderSide(color: isDark ? Colors.grey.shade800 : Colors.grey.shade300),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(20.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                const Row(
+                                  children: [
+                                    Icon(Icons.shield_outlined, color: Colors.indigo, size: 22),
+                                    SizedBox(width: 8),
+                                    Text('Security PIN Lock', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                                  ],
+                                ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    color: currentUser?.hasPin == true
+                                        ? Colors.green.shade50
+                                        : Colors.amber.shade50,
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(
+                                      color: currentUser?.hasPin == true
+                                          ? Colors.green.shade300
+                                          : Colors.amber.shade300,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    currentUser?.hasPin == true ? 'Configured' : 'Not Set',
+                                    style: TextStyle(
+                                      color: currentUser?.hasPin == true ? Colors.green.shade800 : Colors.amber.shade900,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              currentUser?.hasPin == true
+                                  ? 'Your sensitive notes are protected with your private security PIN.'
+                                  : 'Configure a 4-to-6 digit PIN to lock sensitive notes and prevent unauthorized viewing.',
+                              style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+                            ),
+                            const SizedBox(height: 14),
+                            OutlinedButton.icon(
+                              onPressed: () async {
+                                final changed = await promptSetPinDialog(context);
+                                if (changed && mounted) {
+                                  setState(() {});
+                                }
+                              },
+                              style: OutlinedButton.styleFrom(
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                side: const BorderSide(color: Colors.indigo),
+                              ),
+                              icon: Icon(currentUser?.hasPin == true ? Icons.pin : Icons.add_moderator_outlined, color: Colors.indigo),
+                              label: Text(
+                                currentUser?.hasPin == true ? 'Change Security PIN' : 'Configure Security PIN',
+                                style: const TextStyle(color: Colors.indigo, fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                            if (currentUser?.hasPin == true) ...[
+                              const SizedBox(height: 6),
+                              TextButton.icon(
+                                icon: const Icon(Icons.mail_lock_outlined, size: 15),
+                                label: const Text('Forgot Security PIN? Reset via email link', style: TextStyle(fontSize: 12)),
+                                onPressed: () {
+                                  EmailVerificationHelper.showResetPinFlow(
+                                    context,
+                                    initialEmail: currentUser?.email ?? '',
+                                  );
+                                },
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Account Stats & Information
+                    Card(
+                      elevation: 0,
+                      color: cardBg,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        side: BorderSide(color: isDark ? Colors.grey.shade800 : Colors.grey.shade300),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(20.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Row(
+                              children: [
+                                Icon(Icons.info_outline, color: Colors.indigo, size: 20),
+                                SizedBox(width: 8),
+                                Text('Account Information', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                              ],
+                            ),
+                            const SizedBox(height: 14),
+                            _buildInfoRow('Account ID', currentUser?.id ?? 'N/A'),
+                            const Divider(height: 20),
+                            _buildInfoRow('Member Since', memberSince),
+                            const Divider(height: 20),
+                            _buildInfoRow('Vault Notes', '$_noteCount note(s) stored'),
+                            const Divider(height: 20),
+                            _buildInfoRow('Storage Encryption', 'SHA-256 Salted & Partitioned'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+
+                    // Log Out Action
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48,
+                      child: OutlinedButton.icon(
+                        onPressed: _handleLogout,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.red,
+                          side: const BorderSide(color: Colors.red),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        icon: const Icon(Icons.logout),
+                        label: const Text('Log Out of Account', style: TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        Flexible(
+          child: Text(
+            value,
+            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 
 
