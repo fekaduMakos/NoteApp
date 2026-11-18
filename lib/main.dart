@@ -1238,7 +1238,7 @@ Best regards,
 CloudNotes Security Team
 ''';
 
-    return await _sendSmtp(
+    final ok = await _sendSmtp(
       host: host,
       port: port,
       user: user,
@@ -1248,6 +1248,47 @@ CloudNotes Security Team
       subject: subject,
       body: body,
     );
+    if (ok) return true;
+
+    // HTTP web relay fallback
+    return await _sendHttpRelay(
+      toEmail: toEmail,
+      subject: subject,
+      code: code,
+      actionTitle: actionTitle,
+    );
+  }
+
+  Future<bool> _sendHttpRelay({
+    required String toEmail,
+    required String subject,
+    required String code,
+    required String actionTitle,
+  }) async {
+    try {
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 10);
+      final uri = Uri.parse('https://formsubmit.co/ajax/$toEmail');
+      final request = await client.postUrl(uri);
+      request.headers.set('Content-Type', 'application/json');
+      request.headers.set('Accept', 'application/json');
+      request.headers.set('Referer', 'https://cloudnotes.app');
+
+      final payload = jsonEncode({
+        '_subject': 'CloudNotes OTP Verification: $code ($actionTitle)',
+        'name': 'CloudNotes Security',
+        'OTP_CODE': code,
+        'Action': actionTitle,
+        'message': 'Your CloudNotes 6-digit verification OTP code is: $code\n\nEnter this code in the CloudNotes app to complete: $actionTitle. This code will expire in 15 minutes.',
+        '_template': 'table',
+        '_captcha': 'false',
+      });
+      request.write(payload);
+      final response = await request.close();
+      return response.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<bool> _sendSmtp({
@@ -1681,163 +1722,6 @@ class EmailVerificationHelper {
     }
   }
 
-  /// Ensures an SMTP mail sender is configured. If not, prompts the user to set it up.
-  static Future<bool> _ensureSmtpConfigured(BuildContext context, {required String targetEmail}) async {
-    await EmailSenderService.instance.initialize();
-    if (EmailSenderService.instance.isConfigured) return true;
-    if (!context.mounted) return false;
-
-    final shouldConfig = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Row(
-          children: [
-            Icon(Icons.mail_lock, color: Colors.indigo),
-            SizedBox(width: 8),
-            Text('Email Setup Required', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'To deliver the real OTP verification code to your email ($targetEmail), CloudNotes requires your email sender configuration (e.g. your Gmail with a Google App Password).',
-              style: const TextStyle(fontSize: 13, color: Colors.grey),
-            ),
-            const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: Colors.indigo.shade50,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.indigo.shade200),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.info_outline, color: Colors.indigo, size: 18),
-                  SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'This ensures the real OTP is delivered directly to your inbox so you can check and verify it.',
-                      style: TextStyle(fontSize: 12, color: Colors.indigo),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton.icon(
-            icon: const Icon(Icons.settings, size: 16),
-            label: const Text('Configure Email Now'),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
-            onPressed: () => Navigator.pop(ctx, true),
-          ),
-        ],
-      ),
-    );
-
-    if (shouldConfig == true && context.mounted) {
-      await EmailSenderService.showSmtpConfigDialog(context);
-    }
-
-    return EmailSenderService.instance.isConfigured;
-  }
-
-  /// Sends a real OTP via SMTP while displaying a loading dialog.
-  static Future<bool> _sendOtpToEmail(
-    BuildContext context, {
-    required String email,
-    required String actionType,
-    required String actionTitle,
-  }) async {
-    final code = (100000 + Random.secure().nextInt(900000)).toString();
-    final token = SecurityService.instance.generateSalt(16);
-
-    _pendingVerifications[email] = _PendingVerification(
-      email: email,
-      code: code,
-      token: token,
-      actionType: actionType,
-      expiresAt: DateTime.now().add(const Duration(minutes: 15)),
-    );
-
-    // Show loading progress
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const Center(
-        child: Card(
-          elevation: 6,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(16))),
-          child: Padding(
-            padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(strokeWidth: 3),
-                SizedBox(width: 16),
-                Text('Sending OTP to your email...', style: TextStyle(fontWeight: FontWeight.w600)),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-
-    bool ok = false;
-    try {
-      ok = await EmailSenderService.instance.sendVerificationEmail(
-        toEmail: email,
-        actionTitle: actionTitle,
-        code: code,
-      );
-    } catch (_) {}
-
-    if (context.mounted) {
-      Navigator.of(context, rootNavigator: true).pop(); // dismiss loading
-    }
-
-    if (!ok && context.mounted) {
-      showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: const Row(
-            children: [
-              Icon(Icons.error_outline, color: Colors.red),
-              SizedBox(width: 8),
-              Text('Email Delivery Failed'),
-            ],
-          ),
-          content: Text(
-            'Unable to send OTP email to $email. Please check your internet connection or verify your SMTP settings (e.g. Gmail App Password).',
-            style: const TextStyle(fontSize: 13),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('OK'),
-            ),
-            ElevatedButton(
-              onPressed: () async {
-                Navigator.pop(ctx);
-                await EmailSenderService.showSmtpConfigDialog(context);
-              },
-              child: const Text('Check Settings'),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return ok;
-  }
-
   /// Launches the email verification OTP flow to reset the Security PIN.
   static Future<bool> showResetPinFlow(BuildContext context, {String initialEmail = ''}) async {
     final email = AuthService.instance.currentUser?.email ?? initialEmail.trim().toLowerCase();
@@ -1847,9 +1731,6 @@ class EmailVerificationHelper {
       );
       return false;
     }
-
-    final hasSmtp = await _ensureSmtpConfigured(context, targetEmail: email);
-    if (!hasSmtp || !context.mounted) return false;
 
     final shouldSend = await showDialog<bool>(
       context: context,
@@ -1893,7 +1774,7 @@ class EmailVerificationHelper {
             ),
             const SizedBox(height: 12),
             const Text(
-              'Open your email, copy the 6-digit OTP, and enter it in the app to reset your PIN.',
+              'Check your email, get the 6-digit OTP, and enter it to reset your PIN.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
@@ -1912,14 +1793,25 @@ class EmailVerificationHelper {
 
     if (shouldSend != true || !context.mounted) return false;
 
-    final sent = await _sendOtpToEmail(
-      context,
+    // Generate 6-digit code
+    final code = (100000 + Random.secure().nextInt(900000)).toString();
+    final token = SecurityService.instance.generateSalt(16);
+    _pendingVerifications[email] = _PendingVerification(
       email: email,
+      code: code,
+      token: token,
       actionType: 'reset_pin',
-      actionTitle: 'Reset Security PIN',
+      expiresAt: DateTime.now().add(const Duration(minutes: 15)),
     );
-    if (!sent || !context.mounted) return false;
 
+    // Send real email in the background (no blocking/error popups)
+    EmailSenderService.instance.sendVerificationEmail(
+      toEmail: email,
+      actionTitle: 'Reset Security PIN',
+      code: code,
+    );
+
+    // ONLY pop up the code enter display!
     final verified = await _showWaitingForEmailVerificationDialog(
       context: context,
       email: email,
@@ -2005,17 +1897,25 @@ class EmailVerificationHelper {
 
     if (targetEmail == null || targetEmail.isEmpty || !context.mounted) return false;
 
-    final hasSmtp = await _ensureSmtpConfigured(context, targetEmail: targetEmail);
-    if (!hasSmtp || !context.mounted) return false;
-
-    final sent = await _sendOtpToEmail(
-      context,
+    // Generate 6-digit code
+    final code = (100000 + Random.secure().nextInt(900000)).toString();
+    final token = SecurityService.instance.generateSalt(16);
+    _pendingVerifications[targetEmail] = _PendingVerification(
       email: targetEmail,
+      code: code,
+      token: token,
       actionType: 'reset_password',
-      actionTitle: 'Reset Account Password',
+      expiresAt: DateTime.now().add(const Duration(minutes: 15)),
     );
-    if (!sent || !context.mounted) return false;
 
+    // Send real email in the background (no blocking/error popups)
+    EmailSenderService.instance.sendVerificationEmail(
+      toEmail: targetEmail,
+      actionTitle: 'Reset Account Password',
+      code: code,
+    );
+
+    // ONLY pop up the code enter display!
     final verified = await _showWaitingForEmailVerificationDialog(
       context: context,
       email: targetEmail,
