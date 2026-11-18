@@ -2,7 +2,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -1205,7 +1204,7 @@ class EmailSenderService {
     required String toEmail,
     required String actionTitle,
     required String code,
-    required String verificationLink,
+    String? verificationLink,
   }) async {
     await initialize();
     if (!isConfigured) return false;
@@ -1216,19 +1215,24 @@ class EmailSenderService {
     final pass = _prefs!.getString(_smtpPassKey)!;
     final from = smtpSender ?? user;
 
-    final subject = 'CloudNotes Security: $actionTitle';
+    final subject = 'CloudNotes Verification OTP: $code ($actionTitle)';
+    final linkText = (verificationLink != null && verificationLink.isNotEmpty)
+        ? '\nOr touch this link to verify:\n$verificationLink\n'
+        : '';
     final body = '''
 Hello,
 
 You requested a security verification for your CloudNotes account ($toEmail).
 
-Your 6-digit Verification Code is:
-$code
+Your 6-digit Verification Code (OTP) is:
 
-Or open this link on your device to verify:
-$verificationLink
+======================
+       $code
+======================
 
-This code will expire in 15 minutes. If you did not request this, please ignore this email.
+Please enter this OTP code in the CloudNotes app to complete: $actionTitle.
+$linkText
+This code will expire in 15 minutes. If you did not request this OTP, please protect your account.
 
 Best regards,
 CloudNotes Security Team
@@ -1258,60 +1262,83 @@ CloudNotes Security Team
   }) async {
     Socket? socket;
     try {
+      Stream<List<int>> stream;
+      _SmtpStreamReader reader;
+
       if (port == 465) {
         socket = await SecureSocket.connect(
           host,
           port,
-          timeout: const Duration(seconds: 8),
+          timeout: const Duration(seconds: 10),
           onBadCertificate: (_) => true,
         );
+        stream = socket.asBroadcastStream();
+        reader = _SmtpStreamReader(stream);
+
+        final banner = await reader.readLine().timeout(const Duration(seconds: 8));
+        if (!banner.startsWith('220')) return false;
+
+        socket.write('EHLO localhost\r\n');
+        await reader.readResponse().timeout(const Duration(seconds: 8));
       } else {
         socket = await Socket.connect(
           host,
           port,
-          timeout: const Duration(seconds: 8),
+          timeout: const Duration(seconds: 10),
         );
+        stream = socket.asBroadcastStream();
+        reader = _SmtpStreamReader(stream);
+
+        final banner = await reader.readLine().timeout(const Duration(seconds: 8));
+        if (!banner.startsWith('220')) return false;
+
+        socket.write('EHLO localhost\r\n');
+        await reader.readResponse().timeout(const Duration(seconds: 8));
+
+        socket.write('STARTTLS\r\n');
+        final tlsPrompt = await reader.readLine().timeout(const Duration(seconds: 8));
+        if (!tlsPrompt.startsWith('220')) return false;
+
+        socket = await SecureSocket.secure(
+          socket,
+          host: host,
+          onBadCertificate: (_) => true,
+        );
+        stream = socket.asBroadcastStream();
+        reader = _SmtpStreamReader(stream);
+
+        socket.write('EHLO localhost\r\n');
+        await reader.readResponse().timeout(const Duration(seconds: 8));
       }
-
-      final stream = socket.asBroadcastStream();
-      final reader = _SmtpStreamReader(stream);
-
-      // Read 220 banner
-      final banner = await reader.readLine().timeout(const Duration(seconds: 6));
-      if (!banner.startsWith('220')) return false;
-
-      // EHLO
-      socket.write('EHLO localhost\r\n');
-      await reader.readResponse().timeout(const Duration(seconds: 6));
 
       // AUTH LOGIN
       socket.write('AUTH LOGIN\r\n');
-      final authPrompt = await reader.readLine().timeout(const Duration(seconds: 6));
+      final authPrompt = await reader.readLine().timeout(const Duration(seconds: 8));
       if (!authPrompt.startsWith('334')) return false;
 
       // Username base64
       socket.write('${base64Encode(utf8.encode(user))}\r\n');
-      final passPrompt = await reader.readLine().timeout(const Duration(seconds: 6));
+      final passPrompt = await reader.readLine().timeout(const Duration(seconds: 8));
       if (!passPrompt.startsWith('334')) return false;
 
       // Password base64
       socket.write('${base64Encode(utf8.encode(pass))}\r\n');
-      final authResult = await reader.readLine().timeout(const Duration(seconds: 6));
+      final authResult = await reader.readLine().timeout(const Duration(seconds: 8));
       if (!authResult.startsWith('235')) return false;
 
       // MAIL FROM
       socket.write('MAIL FROM:<$from>\r\n');
-      final mailFromResp = await reader.readLine().timeout(const Duration(seconds: 6));
+      final mailFromResp = await reader.readLine().timeout(const Duration(seconds: 8));
       if (!mailFromResp.startsWith('250')) return false;
 
       // RCPT TO
       socket.write('RCPT TO:<$to>\r\n');
-      final rcptResp = await reader.readLine().timeout(const Duration(seconds: 6));
+      final rcptResp = await reader.readLine().timeout(const Duration(seconds: 8));
       if (!rcptResp.startsWith('250')) return false;
 
       // DATA
       socket.write('DATA\r\n');
-      final dataPrompt = await reader.readLine().timeout(const Duration(seconds: 6));
+      final dataPrompt = await reader.readLine().timeout(const Duration(seconds: 8));
       if (!dataPrompt.startsWith('354')) return false;
 
       // Message Content
@@ -1325,7 +1352,7 @@ CloudNotes Security Team
       msg.write('\r\n.\r\n');
 
       socket.write(msg.toString());
-      final finalResp = await reader.readLine().timeout(const Duration(seconds: 8));
+      final finalResp = await reader.readLine().timeout(const Duration(seconds: 10));
 
       socket.write('QUIT\r\n');
       return finalResp.startsWith('250');
@@ -1339,9 +1366,10 @@ CloudNotes Security Team
   static Future<void> showSmtpConfigDialog(BuildContext context) async {
     await instance.initialize();
     if (!context.mounted) return;
-    final hostController = TextEditingController(text: instance.smtpHost ?? '');
+    final defaultUser = instance.smtpUser ?? AuthService.instance.currentUser?.email ?? '';
+    final hostController = TextEditingController(text: instance.smtpHost ?? 'smtp.gmail.com');
     final portController = TextEditingController(text: '${instance.smtpPort}');
-    final userController = TextEditingController(text: instance.smtpUser ?? '');
+    final userController = TextEditingController(text: defaultUser);
     final passController = TextEditingController(text: instance._prefs?.getString(_smtpPassKey) ?? '');
     final senderController = TextEditingController(text: instance.smtpSender ?? '');
 
@@ -1367,10 +1395,29 @@ CloudNotes Security Team
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'Configure an SMTP email server (e.g. Gmail, Outlook, SendGrid) to deliver verification codes directly to user inboxes over the internet.',
+                  'Configure an SMTP email server (e.g. Gmail, Outlook, SendGrid) to deliver real verification OTP codes directly to user email inboxes.',
                   style: TextStyle(fontSize: 13, color: Colors.grey),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.indigo.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.indigo.shade200),
+                  ),
+                  child: const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Gmail Setup in 3 Simple Steps:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.indigo)),
+                      SizedBox(height: 4),
+                      Text('1. Go to Google Account > Security > 2-Step Verification.', style: TextStyle(fontSize: 11, color: Colors.indigo)),
+                      Text('2. Open "App passwords" and create a password for "CloudNotes".', style: TextStyle(fontSize: 11, color: Colors.indigo)),
+                      Text('3. Paste the 16-character password below and tap Save & Test.', style: TextStyle(fontSize: 11, color: Colors.indigo)),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
                 TextField(
                   controller: hostController,
                   decoration: const InputDecoration(
@@ -1634,7 +1681,164 @@ class EmailVerificationHelper {
     }
   }
 
-  /// Launches the email verification link flow to reset the Security PIN.
+  /// Ensures an SMTP mail sender is configured. If not, prompts the user to set it up.
+  static Future<bool> _ensureSmtpConfigured(BuildContext context, {required String targetEmail}) async {
+    await EmailSenderService.instance.initialize();
+    if (EmailSenderService.instance.isConfigured) return true;
+    if (!context.mounted) return false;
+
+    final shouldConfig = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.mail_lock, color: Colors.indigo),
+            SizedBox(width: 8),
+            Text('Email Setup Required', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'To deliver the real OTP verification code to your email ($targetEmail), CloudNotes requires your email sender configuration (e.g. your Gmail with a Google App Password).',
+              style: const TextStyle(fontSize: 13, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.indigo.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.indigo.shade200),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.info_outline, color: Colors.indigo, size: 18),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'This ensures the real OTP is delivered directly to your inbox so you can check and verify it.',
+                      style: TextStyle(fontSize: 12, color: Colors.indigo),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.settings, size: 16),
+            label: const Text('Configure Email Now'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldConfig == true && context.mounted) {
+      await EmailSenderService.showSmtpConfigDialog(context);
+    }
+
+    return EmailSenderService.instance.isConfigured;
+  }
+
+  /// Sends a real OTP via SMTP while displaying a loading dialog.
+  static Future<bool> _sendOtpToEmail(
+    BuildContext context, {
+    required String email,
+    required String actionType,
+    required String actionTitle,
+  }) async {
+    final code = (100000 + Random.secure().nextInt(900000)).toString();
+    final token = SecurityService.instance.generateSalt(16);
+
+    _pendingVerifications[email] = _PendingVerification(
+      email: email,
+      code: code,
+      token: token,
+      actionType: actionType,
+      expiresAt: DateTime.now().add(const Duration(minutes: 15)),
+    );
+
+    // Show loading progress
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(
+        child: Card(
+          elevation: 6,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(16))),
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(strokeWidth: 3),
+                SizedBox(width: 16),
+                Text('Sending OTP to your email...', style: TextStyle(fontWeight: FontWeight.w600)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    bool ok = false;
+    try {
+      ok = await EmailSenderService.instance.sendVerificationEmail(
+        toEmail: email,
+        actionTitle: actionTitle,
+        code: code,
+      );
+    } catch (_) {}
+
+    if (context.mounted) {
+      Navigator.of(context, rootNavigator: true).pop(); // dismiss loading
+    }
+
+    if (!ok && context.mounted) {
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(
+            children: [
+              Icon(Icons.error_outline, color: Colors.red),
+              SizedBox(width: 8),
+              Text('Email Delivery Failed'),
+            ],
+          ),
+          content: Text(
+            'Unable to send OTP email to $email. Please check your internet connection or verify your SMTP settings (e.g. Gmail App Password).',
+            style: const TextStyle(fontSize: 13),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                await EmailSenderService.showSmtpConfigDialog(context);
+              },
+              child: const Text('Check Settings'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return ok;
+  }
+
+  /// Launches the email verification OTP flow to reset the Security PIN.
   static Future<bool> showResetPinFlow(BuildContext context, {String initialEmail = ''}) async {
     final email = AuthService.instance.currentUser?.email ?? initialEmail.trim().toLowerCase();
     if (email.isEmpty) {
@@ -1643,6 +1847,9 @@ class EmailVerificationHelper {
       );
       return false;
     }
+
+    final hasSmtp = await _ensureSmtpConfigured(context, targetEmail: email);
+    if (!hasSmtp || !context.mounted) return false;
 
     final shouldSend = await showDialog<bool>(
       context: context,
@@ -1660,7 +1867,7 @@ class EmailVerificationHelper {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'A secure verification link will be sent to your registered account email:',
+              'A 6-digit OTP verification code will be sent to your registered email address:',
               style: TextStyle(fontSize: 13, color: Colors.grey),
             ),
             const SizedBox(height: 12),
@@ -1686,7 +1893,7 @@ class EmailVerificationHelper {
             ),
             const SizedBox(height: 12),
             const Text(
-              'For high security and cross-checking, the verification link is sent directly to your email (and system notification tray). Touch that link to open the "Add New PIN" interface.',
+              'Open your email, copy the 6-digit OTP, and enter it in the app to reset your PIN.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
@@ -1695,7 +1902,7 @@ class EmailVerificationHelper {
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           ElevatedButton.icon(
             icon: const Icon(Icons.send, size: 16),
-            label: const Text('Send Verification Link'),
+            label: const Text('Send Verification Code'),
             style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
             onPressed: () => Navigator.pop(ctx, true),
           ),
@@ -1705,26 +1912,19 @@ class EmailVerificationHelper {
 
     if (shouldSend != true || !context.mounted) return false;
 
-    final code = (100000 + Random.secure().nextInt(900000)).toString();
-    final token = SecurityService.instance.generateSalt(16);
-
-    final emailSent = await _dispatchExternalEmailVerification(
+    final sent = await _sendOtpToEmail(
+      context,
       email: email,
       actionType: 'reset_pin',
       actionTitle: 'Reset Security PIN',
-      code: code,
-      token: token,
     );
-
-    if (!context.mounted) return false;
+    if (!sent || !context.mounted) return false;
 
     final verified = await _showWaitingForEmailVerificationDialog(
       context: context,
       email: email,
       actionTitle: 'Reset Security PIN',
       actionType: 'reset_pin',
-      code: code,
-      emailSent: emailSent,
     );
 
     if (verified && context.mounted) {
@@ -1733,7 +1933,7 @@ class EmailVerificationHelper {
     return false;
   }
 
-  /// Launches the email verification link flow to reset the Account Password.
+  /// Launches the email verification OTP flow to reset the Account Password.
   static Future<bool> showResetPasswordFlow(BuildContext context, {String initialEmail = ''}) async {
     final emailController = TextEditingController(text: initialEmail.trim().toLowerCase());
     String? errorMsg;
@@ -1755,7 +1955,7 @@ class EmailVerificationHelper {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Enter your registered email address. We will send a secure verification link to reset your account password.',
+                'Enter your registered email address. We will send a 6-digit OTP to your email to verify and reset your password.',
                 style: TextStyle(fontSize: 13, color: Colors.grey),
               ),
               const SizedBox(height: 16),
@@ -1782,7 +1982,7 @@ class EmailVerificationHelper {
             TextButton(onPressed: () => Navigator.pop(ctx, null), child: const Text('Cancel')),
             ElevatedButton.icon(
               icon: const Icon(Icons.send, size: 16),
-              label: const Text('Send Reset Link'),
+              label: const Text('Send Verification Code'),
               style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
               onPressed: () async {
                 final email = emailController.text.trim().toLowerCase();
@@ -1805,26 +2005,22 @@ class EmailVerificationHelper {
 
     if (targetEmail == null || targetEmail.isEmpty || !context.mounted) return false;
 
-    final code = (100000 + Random.secure().nextInt(900000)).toString();
-    final token = SecurityService.instance.generateSalt(16);
+    final hasSmtp = await _ensureSmtpConfigured(context, targetEmail: targetEmail);
+    if (!hasSmtp || !context.mounted) return false;
 
-    final emailSent = await _dispatchExternalEmailVerification(
+    final sent = await _sendOtpToEmail(
+      context,
       email: targetEmail,
       actionType: 'reset_password',
       actionTitle: 'Reset Account Password',
-      code: code,
-      token: token,
     );
-
-    if (!context.mounted) return false;
+    if (!sent || !context.mounted) return false;
 
     final verified = await _showWaitingForEmailVerificationDialog(
       context: context,
       email: targetEmail,
       actionTitle: 'Reset Account Password',
       actionType: 'reset_password',
-      code: code,
-      emailSent: emailSent,
     );
 
     if (verified && context.mounted) {
@@ -1833,74 +2029,18 @@ class EmailVerificationHelper {
     return false;
   }
 
-  /// Dispatches the verification link externally to the saved email address (via SMTP) and system notifications.
-  static Future<bool> _dispatchExternalEmailVerification({
-    required String email,
-    required String actionType,
-    required String actionTitle,
-    required String code,
-    required String token,
-  }) async {
-    final link = 'noteapp://vault/verify?type=$actionType&email=$email&code=$code&token=$token';
-
-    _pendingVerifications[email] = _PendingVerification(
-      email: email,
-      code: code,
-      token: token,
-      actionType: actionType,
-      expiresAt: DateTime.now().add(const Duration(minutes: 15)),
-    );
-
-    // 1. Dispatch real email via SMTP if configured
-    bool emailSent = false;
-    try {
-      emailSent = await EmailSenderService.instance.sendVerificationEmail(
-        toEmail: email,
-        actionTitle: actionTitle,
-        code: code,
-        verificationLink: link,
-      );
-    } catch (_) {}
-
-    // 2. Dispatch local notification as system tray backup
-    try {
-      final androidDetails = AndroidNotificationDetails(
-        'security_vault_email',
-        'Security & Email Verification',
-        channelDescription: 'Delivers multi-cross-check security verification links to saved email',
-        importance: Importance.max,
-        priority: Priority.high,
-        showWhen: true,
-        icon: '@mipmap/ic_launcher',
-        styleInformation: BigTextStyleInformation(
-          'Verification Code: $code\nTouch link to proceed:\n$link',
-        ),
-      );
-
-      await _notifications.show(
-        id: 99991,
-        title: '📧 Vault Security: $actionTitle Link',
-        body: 'To: $email • Code: $code (Touch link to verify)',
-        notificationDetails: NotificationDetails(android: androidDetails),
-        payload: 'verify:$actionType:$email:$code:$token',
-      );
-    } catch (_) {}
-
-    return emailSent;
-  }
-
-  /// Displays the secure verification screen with instant code auto-fill and SMTP status.
+  /// Displays the OTP input dialog: user enters the OTP they received in their email.
+  /// NO OTP CODE IS DISPLAYED ON THIS SCREEN.
   static Future<bool> _showWaitingForEmailVerificationDialog({
     required BuildContext context,
     required String email,
     required String actionTitle,
     required String actionType,
-    required String code,
-    bool emailSent = false,
   }) async {
     final codeController = TextEditingController();
     String? errorMsg;
     bool isClosedByExternalTouch = false;
+    bool isResending = false;
 
     final result = await showDialog<bool>(
       context: context,
@@ -1923,190 +2063,70 @@ class EmailVerificationHelper {
                 ),
                 const SizedBox(width: 10),
                 const Expanded(
-                  child: Text('Verification Code', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  child: Text('Enter Verification Code', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 ),
               ],
             ),
             content: SingleChildScrollView(
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
+                constraints: const BoxConstraints(maxWidth: 400),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Email destination pill
+                    const Text(
+                      'We have sent a 6-digit OTP code to your registered email:',
+                      style: TextStyle(fontSize: 13, color: Colors.grey),
+                    ),
+                    const SizedBox(height: 10),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       decoration: BoxDecoration(
-                        color: Colors.grey.shade100,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.grey.shade300),
+                        color: Colors.indigo.shade50,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.indigo.shade200),
                       ),
                       child: Row(
                         children: [
-                          const Icon(Icons.alternate_email, size: 16, color: Colors.indigo),
+                          const Icon(Icons.email, size: 18, color: Colors.indigo),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
                               email,
-                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                              style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo, fontSize: 13),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
                         ],
                       ),
                     ),
-                    const SizedBox(height: 10),
-
-                    // Delivery status banner
-                    if (emailSent)
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: Colors.green.shade50,
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: Colors.green.shade300),
-                        ),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.check_circle, color: Colors.green, size: 20),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'Verification email sent to $email via SMTP. Check your inbox or Spam folder.',
-                                style: TextStyle(color: Colors.green.shade900, fontSize: 12),
-                              ),
-                            ),
-                          ],
-                        ),
-                      )
-                    else
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: Colors.blue.shade50,
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: Colors.blue.shade300),
-                        ),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(Icons.mark_email_unread_outlined, color: Colors.blue.shade800, size: 20),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    'Instant Device Security Verification',
-                                    style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue.shade900, fontSize: 12),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    'Your 6-digit code has been generated directly on this device. You can verify immediately or configure an SMTP server (e.g. Gmail) for internet delivery.',
-                                    style: TextStyle(color: Colors.blue.shade800, fontSize: 11),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                    const SizedBox(height: 14),
-
-                    // Instant Device Verification Code Card
+                    const SizedBox(height: 12),
                     Container(
-                      padding: const EdgeInsets.all(14),
+                      padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [Colors.indigo.shade50, Colors.deepPurple.shade50],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(color: Colors.indigo.shade300, width: 1.5),
+                        color: Colors.amber.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.amber.shade300),
                       ),
-                      child: Column(
+                      child: Row(
                         children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              const Row(
-                                children: [
-                                  Icon(Icons.key, size: 16, color: Colors.indigo),
-                                  SizedBox(width: 6),
-                                  Text(
-                                    'Instant Security Code',
-                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.indigo),
-                                  ),
-                                ],
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.copy, size: 18, color: Colors.indigo),
-                                tooltip: 'Copy code',
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(),
-                                onPressed: () {
-                                  Clipboard.setData(ClipboardData(text: code));
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(content: Text('Verification code copied to clipboard!')),
-                                  );
-                                },
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          SelectableText(
-                            code,
-                            style: const TextStyle(
-                              fontSize: 28,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: 8,
-                              color: Colors.indigo,
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          SizedBox(
-                            width: double.infinity,
-                            child: ElevatedButton.icon(
-                              icon: const Icon(Icons.bolt, size: 18),
-                              label: const Text('Auto-Fill & Verify Immediately', style: TextStyle(fontWeight: FontWeight.bold)),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.indigo,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 10),
-                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                              ),
-                              onPressed: () {
-                                final pending = _pendingVerifications[email];
-                                if (pending != null && !DateTime.now().isAfter(pending.expiresAt)) {
-                                  _pendingVerifications.remove(email);
-                                  _dismissWaitingDialog = null;
-                                  Navigator.pop(ctx, true);
-                                } else {
-                                  setDlgState(() => errorMsg = 'Code has expired. Please request a new one.');
-                                }
-                              },
+                          Icon(Icons.inbox, size: 18, color: Colors.amber.shade900),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Please check your email inbox (and Spam folder) to get your 6-digit OTP code, then enter it below.',
+                              style: TextStyle(fontSize: 12, color: Colors.amber.shade900),
                             ),
                           ),
                         ],
                       ),
                     ),
-
-                    const SizedBox(height: 14),
-                    const Row(
-                      children: [
-                        Expanded(child: Divider()),
-                        Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 8),
-                          child: Text('OR ENTER MANUALLY', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
-                        ),
-                        Expanded(child: Divider()),
-                      ],
+                    const SizedBox(height: 18),
+                    const Text(
+                      'Enter 6-digit OTP:',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
                     ),
-                    const SizedBox(height: 10),
-
+                    const SizedBox(height: 8),
                     if (errorMsg != null)
                       Container(
                         margin: const EdgeInsets.only(bottom: 8),
@@ -2114,28 +2134,57 @@ class EmailVerificationHelper {
                         decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
                         child: Text(errorMsg!, style: TextStyle(color: Colors.red.shade900, fontSize: 12)),
                       ),
-
                     TextField(
                       controller: codeController,
                       keyboardType: TextInputType.number,
                       maxLength: 6,
+                      autofocus: true,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 20, letterSpacing: 4, fontWeight: FontWeight.bold),
+                      style: const TextStyle(fontSize: 24, letterSpacing: 6, fontWeight: FontWeight.bold),
                       decoration: InputDecoration(
                         hintText: '• • • • • •',
                         counterText: '',
                         prefixIcon: const Icon(Icons.pin),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                     ),
-
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.center,
+                    const SizedBox(height: 12),
+                    Center(
                       child: TextButton.icon(
-                        icon: const Icon(Icons.settings_suggest_outlined, size: 16),
-                        label: const Text('Configure SMTP Email Server (Gmail/Outlook)', style: TextStyle(fontSize: 12)),
-                        onPressed: () => EmailSenderService.showSmtpConfigDialog(context),
+                        icon: isResending
+                            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.refresh, size: 16),
+                        label: Text(isResending ? 'Resending...' : "Didn't get code? Resend OTP"),
+                        onPressed: isResending
+                            ? null
+                            : () async {
+                                setDlgState(() => isResending = true);
+                                final newCode = (100000 + Random.secure().nextInt(900000)).toString();
+                                final token = SecurityService.instance.generateSalt(16);
+                                _pendingVerifications[email] = _PendingVerification(
+                                  email: email,
+                                  code: newCode,
+                                  token: token,
+                                  actionType: actionType,
+                                  expiresAt: DateTime.now().add(const Duration(minutes: 15)),
+                                );
+                                final ok = await EmailSenderService.instance.sendVerificationEmail(
+                                  toEmail: email,
+                                  actionTitle: actionTitle,
+                                  code: newCode,
+                                );
+                                setDlgState(() {
+                                  isResending = false;
+                                  if (ok) {
+                                    errorMsg = null;
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('A fresh OTP has been sent to your email!')),
+                                    );
+                                  } else {
+                                    errorMsg = 'Failed to resend email. Check your SMTP settings.';
+                                  }
+                                });
+                              },
                       ),
                     ),
                   ],
@@ -2155,12 +2204,12 @@ class EmailVerificationHelper {
                   final entered = codeController.text.trim();
                   final pending = _pendingVerifications[email];
                   if (pending == null || pending.code != entered) {
-                    setDlgState(() => errorMsg = 'Invalid verification code. Please try again.');
+                    setDlgState(() => errorMsg = 'Invalid OTP code. Please check your email.');
                     return;
                   }
                   if (DateTime.now().isAfter(pending.expiresAt)) {
                     _pendingVerifications.remove(email);
-                    setDlgState(() => errorMsg = 'Verification code has expired. Please request a new link.');
+                    setDlgState(() => errorMsg = 'OTP code has expired. Please tap Resend OTP.');
                     return;
                   }
                   _pendingVerifications.remove(email);
@@ -2168,7 +2217,7 @@ class EmailVerificationHelper {
                   Navigator.pop(ctx, true);
                 },
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
-                child: const Text('Verify Code'),
+                child: const Text('Verify OTP'),
               ),
             ],
           ),
@@ -2179,7 +2228,7 @@ class EmailVerificationHelper {
     _dismissWaitingDialog = null;
 
     if (isClosedByExternalTouch) {
-      return false; // Already handled by handleExternalVerificationPayload
+      return false;
     }
 
     return result ?? false;
